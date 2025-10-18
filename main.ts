@@ -1,4 +1,4 @@
-import {
+﻿import {
   App,
   Notice,
   Plugin,
@@ -78,9 +78,27 @@ export default class KankaSyncPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "kanka-sync-rename-from-heading",
+      name: "Rename current note from first heading",
+      callback: () => void this.renameActiveNoteFromHeading(),
+    });
+
+    this.addCommand({
       id: "kanka-sync-fix-links",
       name: "Fix Kanka links in existing notes",
       callback: () => void this.fixAllLinks(),
+    });
+
+    this.addCommand({
+      id: "kanka-sync-validate-links",
+      name: "Validate existing wiki links",
+      callback: () => void this.validateWikiLinks(),
+    });
+
+    this.addCommand({
+      id: "kanka-sync-link-known-words",
+      name: "Link matching words to Kanka notes",
+      callback: () => void this.linkWordsToEntities(),
     });
   }
 
@@ -415,6 +433,89 @@ export default class KankaSyncPlugin extends Plugin {
     return this.replaceHashLinks(withTokens, resolveName);
   }
 
+  private buildWordMap(index: LocalIndex): Map<string, EntityIndexEntry> {
+    const map = new Map<string, EntityIndexEntry>();
+    for (const entry of index.byId.values()) {
+      this.tokenizeName(entry.name).forEach((token) => {
+        if (!map.has(token)) map.set(token, entry);
+      });
+      if (entry.slug) {
+        this.tokenizeName(entry.slug).forEach((token) => {
+          if (!map.has(token)) map.set(token, entry);
+        });
+      }
+    }
+    return map;
+  }
+
+  private tokenizeName(name: string): string[] {
+    return name
+      .split(/[^A-Za-z0-9À-ÖØ-öø-ÿ]+/)
+      .map((part) => part.trim().toLowerCase())
+      .filter(Boolean);
+  }
+
+  private linkWordsInContent(
+    markdown: string,
+    wordMap: Map<string, EntityIndexEntry>,
+    sourcePath: string
+  ): string {
+    if (!markdown) return markdown;
+
+    const wikiRegex = /\[\[.*?\]\]/g;
+    const mdLinkRegex = /\[.*?\]\(.*?\)/g;
+    const skipRanges: Array<{ start: number; end: number }> = [];
+
+    const markRanges = (regex: RegExp) => {
+      regex.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = regex.exec(markdown)) !== null) {
+        skipRanges.push({ start: match.index, end: match.index + match[0].length });
+      }
+    };
+
+    markRanges(wikiRegex);
+    markRanges(mdLinkRegex);
+
+    skipRanges.sort((a, b) => a.start - b.start);
+
+    let result = "";
+    let cursor = 0;
+
+    for (const range of skipRanges) {
+      if (cursor < range.start) {
+        result += this.replaceWords(markdown.slice(cursor, range.start), wordMap, sourcePath);
+      }
+      result += markdown.slice(range.start, range.end);
+      cursor = range.end;
+    }
+
+    if (cursor < markdown.length) {
+      result += this.replaceWords(markdown.slice(cursor), wordMap, sourcePath);
+    }
+
+    return result;
+  }
+
+  private replaceWords(
+    segment: string,
+    wordMap: Map<string, EntityIndexEntry>,
+    sourcePath: string
+  ): string {
+    const wordRegex = /\b([\p{L}\p{N}]+)\b/gu;
+    return segment.replace(wordRegex, (match, word) => {
+      const normalized = word.toLowerCase();
+      const entry = wordMap.get(normalized);
+      if (!entry) return match;
+      if (entry.path.toLowerCase() === sourcePath.toLowerCase()) return match;
+
+      const dest = this.app.metadataCache.getFirstLinkpathDest(entry.path, sourcePath);
+      if (!dest) return match;
+
+      return `[[${entry.path}|${match}]]`;
+    });
+  }
+
   private replaceEntityTokens(
     markdown: string,
     resolver: (id: string, type?: string) => string | null
@@ -553,6 +654,107 @@ export default class KankaSyncPlugin extends Plugin {
     }
   }
 
+  private async renameActiveNoteFromHeading(): Promise<void> {
+    try {
+      const file = this.app.workspace.getActiveFile();
+      if (!file) {
+        new Notice("Kanka Sync: nessuna nota aperta.");
+        return;
+      }
+      if (file.extension !== "md") {
+        new Notice("Kanka Sync: apri una nota markdown per rinominare.");
+        return;
+      }
+
+      const content = await this.app.vault.read(file);
+      const heading = this.extractFirstHeading(content);
+      if (!heading) {
+        new Notice("Kanka Sync: nessuna intestazione (# Titolo) trovata.");
+        return;
+      }
+
+      const sanitized = this.sanitizeFileName(heading);
+      if (!sanitized) {
+        new Notice("Kanka Sync: il titolo trovato non è utilizzabile come nome file.");
+        return;
+      }
+
+      const folder = file.path.split("/").slice(0, -1).join("/");
+      const desiredPath = normalizePath([folder, `${sanitized}.md`].filter(Boolean).join("/"));
+
+      const occupied = new Set<string>();
+      for (const note of this.app.vault.getMarkdownFiles()) {
+        occupied.add(note.path.toLowerCase());
+      }
+      occupied.delete(file.path.toLowerCase());
+
+      const targetPath = this.findRenameTarget(desiredPath, occupied);
+      if (targetPath === file.path) {
+        new Notice("Kanka Sync: il nome del file è già aggiornato.");
+        return;
+      }
+
+      const targetFolder = targetPath.split("/").slice(0, -1).join("/");
+      if (targetFolder) await this.ensureFolder(targetFolder);
+
+      await this.app.vault.rename(file, targetPath);
+      await this.refreshIndexesFromVault();
+
+      new Notice(`Kanka Sync: rinominato in ${targetPath}`);
+    } catch (error: any) {
+      console.error(error);
+      new Notice(`Kanka Sync: errore rinomina da titolo — ${error?.message || error}`);
+    }
+  }
+
+  private async linkWordsToEntities(): Promise<void> {
+    try {
+      const folder = this.settings.outputFolder.trim();
+      if (!folder) {
+        new Notice("Kanka Sync: configura la cartella di output nelle impostazioni.");
+        return;
+      }
+
+      const index = await this.buildLocalEntityIndex(folder);
+      if (!index.byId.size) {
+        new Notice("Kanka Sync: nessuna nota con kanka_id trovata.");
+        return;
+      }
+
+      const wordMap = this.buildWordMap(index);
+      if (!wordMap.size) {
+        new Notice("Kanka Sync: nessun nome da utilizzare per i link.");
+        return;
+      }
+
+      const files = this.app.vault
+        .getMarkdownFiles()
+        .filter((file) => file.path.startsWith(folder));
+
+      let linked = 0;
+      let untouched = 0;
+
+      for (const file of files) {
+        const original = await this.app.vault.read(file);
+        const converted = this.linkWordsInContent(original, wordMap, file.path);
+        if (converted === original) {
+          untouched += 1;
+          continue;
+        }
+
+        await this.app.vault.modify(file, converted);
+        linked += 1;
+      }
+
+      const report = [`${linked} note aggiornate`];
+      if (untouched) report.push(`${untouched} senza modifiche`);
+      new Notice(`Kanka Sync: parole collegate (${report.join(", ")})`);
+    } catch (error: any) {
+      console.error(error);
+      new Notice(`Kanka Sync: errore link parole � ${error?.message || error}`);
+    }
+  }
+
   private async fixAllLinks(): Promise<void> {
     try {
       const folder = this.settings.outputFolder.trim();
@@ -592,6 +794,46 @@ export default class KankaSyncPlugin extends Plugin {
     } catch (error: any) {
       console.error(error);
       new Notice(`Kanka Sync: errore fix link — ${error?.message || error}`);
+    }
+  }
+
+  private async validateWikiLinks(): Promise<void> {
+    try {
+      const folder = this.settings.outputFolder.trim();
+      if (!folder) {
+        new Notice("Kanka Sync: configura la cartella di output nelle impostazioni.");
+        return;
+      }
+
+      const files = this.app.vault
+        .getMarkdownFiles()
+        .filter((file) => file.path.startsWith(folder));
+
+      if (!files.length) {
+        new Notice("Kanka Sync: nessuna nota trovata nella cartella configurata.");
+        return;
+      }
+
+      let cleaned = 0;
+      let untouched = 0;
+
+      for (const file of files) {
+        const original = await this.app.vault.read(file);
+        const cleanedContent = this.removeInvalidWikiLinks(original, file.path);
+        if (cleanedContent === original) {
+          untouched += 1;
+          continue;
+        }
+        await this.app.vault.modify(file, cleanedContent);
+        cleaned += 1;
+      }
+
+      const stats = [`${cleaned} link corretti`];
+      if (untouched) stats.push(`${untouched} già validi`);
+      new Notice(`Kanka Sync: validazione link completata (${stats.join(", ")})`);
+    } catch (error: any) {
+      console.error(error);
+      new Notice(`Kanka Sync: errore validazione link — ${error?.message || error}`);
     }
   }
 
@@ -687,6 +929,34 @@ export default class KankaSyncPlugin extends Plugin {
   private extractIdFromFilename(basename: string): string {
     const match = basename.match(/^([0-9]+)/);
     return match ? match[1] : basename;
+  }
+
+  private removeInvalidWikiLinks(markdown: string, sourcePath: string): string {
+    const linkRegex = /!?\[\[([^[\]|]+)(\|([^[\]]+))?\]\]/g;
+    let changed = false;
+
+    const cleaned = markdown.replace(linkRegex, (match, target, _aliasPart, aliasDisplay, offset, full) => {
+      if (match.startsWith("!")) return match; // do not touch embeds
+
+      const trimmedTarget = target.trim();
+      const resolved = this.app.metadataCache.getFirstLinkpathDest(trimmedTarget, sourcePath);
+      if (resolved) return match;
+
+      changed = true;
+      const display = (aliasDisplay ?? target).trim();
+      return display;
+    });
+
+    return changed ? cleaned : markdown;
+  }
+
+  private extractFirstHeading(markdown: string): string | null {
+    const lines = markdown.split(/\r?\n/);
+    for (const line of lines) {
+      const match = line.match(/^#{1,6}\s+(.*)$/);
+      if (match) return match[1].trim();
+    }
+    return null;
   }
 
   private extractNameFromPath(path: string): string {
@@ -789,6 +1059,24 @@ class KankaSettingsTab extends PluginSettingTab {
           .setButtonText("Esegui")
           .onClick(() => void this.plugin.renameAllNotes())
       );
+
+    new Setting(containerEl)
+      .setName("Validate wiki links")
+      .setDesc("Rimuove i collegamenti [[...]] che non puntano a note esistenti.")
+      .addButton((button) =>
+        button
+          .setButtonText("Esegui")
+          .onClick(() => void this.plugin.validateWikiLinks())
+      );
+
+    new Setting(containerEl)
+      .setName("Link words to notes")
+      .setDesc("Collega automaticamente le parole che corrispondono a voci Kanka.")
+      .addButton((button) =>
+        button
+          .setButtonText("Esegui")
+          .onClick(() => void this.plugin.linkWordsToEntities())
+      );
   }
 
   private addTextSetting(
@@ -825,3 +1113,5 @@ class KankaSettingsTab extends PluginSettingTab {
       );
   }
 }
+
+
