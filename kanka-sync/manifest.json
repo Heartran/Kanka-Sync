@@ -1,0 +1,10 @@
+{
+  "id": "kanka-sync",
+  "name": "Kanka Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Sync Obsidian notes to Kanka entities (create/update) on save.",
+  "author": "Heartran",
+  "authorUrl": "https://papin-network.it",
+  "isDesktopOnly": true
+}

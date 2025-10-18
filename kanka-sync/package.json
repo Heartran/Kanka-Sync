@@ -1,0 +1,15 @@
+{
+  "name": "kanka-sync",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "esbuild main.ts --bundle --outfile=main.js --platform=browser --format=cjs --external:obsidian --watch",
+    "build": "esbuild main.ts --bundle --minify --outfile=main.js --platform=browser --format=cjs --external:obsidian"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "obsidian": "^1.5.0",
+    "@types/node": "^20.11.0"
+  }
+}
