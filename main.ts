@@ -47,6 +47,7 @@ type EntityIndexEntry = {
 export default class KankaSyncPlugin extends Plugin {
   settings: KankaSettings;
   private entityIndex: Map<string, EntityIndexEntry> = new Map();
+  private usedPaths: Set<string> = new Set(); // lower-case paths for uniqueness
   private lastRequestAt = 0;
   private abortSync = false;
 
@@ -57,17 +58,13 @@ export default class KankaSyncPlugin extends Plugin {
     this.addCommand({
       id: "kanka-sync-pull-markdown",
       name: "Download all Kanka entities (markdown)",
-      callback: () => {
-        void this.syncAllEntities();
-      },
+      callback: () => void this.syncAllEntities(),
     });
 
     this.addCommand({
       id: "kanka-sync-rename-all",
       name: "Rename all Kanka notes from frontmatter",
-      callback: () => {
-        void this.renameAllNotes();
-      },
+      callback: () => void this.renameAllNotes(),
     });
   }
 
@@ -83,17 +80,19 @@ export default class KankaSyncPlugin extends Plugin {
       new Notice("Kanka Sync: download avviato…");
 
       this.entityIndex.clear();
+      this.usedPaths.clear();
+
       const summaries = await this.fetchAllSummaries();
       if (this.abortSync) return;
 
-      const filtered = summaries.filter((summary) => {
+      const validSummaries = summaries.filter((summary) => {
         if (this.settings.skipPrivate && summary.is_private) return false;
         const type = summary.type ?? summary.entity_type ?? "";
         if (this.isTypeExcluded(type)) return false;
         return true;
       });
 
-      filtered.forEach((summary) => {
+      validSummaries.forEach((summary) => {
         const entry = this.buildIndexEntry(summary);
         this.entityIndex.set(String(summary.id), entry);
       });
@@ -103,20 +102,21 @@ export default class KankaSyncPlugin extends Plugin {
       let skipped = 0;
       let failed = 0;
 
-      for (const summary of filtered) {
+      for (const summary of validSummaries) {
         if (this.abortSync) break;
+
         try {
-          const raw = await this.fetchMarkdown(summary.id);
+          const markdown = await this.fetchMarkdown(summary.id);
           const entry = this.entityIndex.get(String(summary.id));
           if (!entry) continue;
-          const content = this.prepareMarkdown(raw, summary, entry);
-          const result = await this.writeEntityFile(entry.path, content);
+          const processed = this.prepareMarkdown(markdown, summary);
+          const result = await this.writeEntityFile(entry.path, processed);
           if (result === "created") created += 1;
           else if (result === "updated") updated += 1;
           else skipped += 1;
         } catch (error) {
           failed += 1;
-          console.error("Kanka Sync: errore su entità #" + summary.id, error);
+          console.error(`Kanka Sync: errore su entità #${summary.id}`, error);
         }
       }
 
@@ -125,13 +125,13 @@ export default class KankaSyncPlugin extends Plugin {
         return;
       }
 
-      const parts = [
+      const pieces = [
         `${created} create`,
         `${updated} aggiornate`,
         `${skipped} invariata`,
       ];
-      if (failed) parts.push(`${failed} errori`);
-      new Notice(`Kanka Sync: ${parts.join(", ")}`);
+      if (failed) pieces.push(`${failed} errori`);
+      new Notice(`Kanka Sync: ${pieces.join(", ")}`);
     } catch (error: any) {
       console.error(error);
       new Notice(`Kanka Sync: errore — ${error?.message || error}`);
@@ -150,8 +150,7 @@ export default class KankaSyncPlugin extends Plugin {
     const collected: KankaEntitySummary[] = [];
     let page = 1;
 
-    while (true) {
-      if (this.abortSync) break;
+    while (!this.abortSync) {
       const response = await this.apiRequest<{ data: KankaEntitySummary[]; meta?: any }>(
         `/entities?page=${page}`
       );
@@ -159,9 +158,8 @@ export default class KankaSyncPlugin extends Plugin {
       if (!data.length) break;
       collected.push(...data);
 
-      const pagination = response.meta?.pagination;
-      if (!pagination) break;
-      if (page >= pagination.total_pages) break;
+      const totalPages = response.meta?.pagination?.total_pages ?? page;
+      if (page >= totalPages) break;
       page += 1;
     }
 
@@ -170,9 +168,9 @@ export default class KankaSyncPlugin extends Plugin {
 
   private async fetchMarkdown(entityId: number): Promise<string> {
     await this.throttle();
-    const campaignId = this.settings.campaignId.trim();
+    const campaign = this.settings.campaignId.trim();
     const response = await requestUrl({
-      url: `https://app.kanka.io/w/${encodeURIComponent(campaignId)}/entities/${entityId}.md`,
+      url: `https://app.kanka.io/w/${encodeURIComponent(campaign)}/entities/${entityId}.md`,
       method: "GET",
       headers: {
         "Authorization": `Bearer ${this.settings.apiToken.trim()}`,
@@ -200,7 +198,7 @@ export default class KankaSyncPlugin extends Plugin {
     }
   }
 
-  private prepareMarkdown(markdown: string, summary: KankaEntitySummary, entry: EntityIndexEntry) {
+  private prepareMarkdown(markdown: string, summary: KankaEntitySummary): string {
     const stripped = this.stripFrontmatter(markdown).trim();
     const hasHeading = stripped.startsWith("#");
     const heading = summary.name ? `# ${summary.name.trim()}` : "";
@@ -233,8 +231,9 @@ export default class KankaSyncPlugin extends Plugin {
   private buildIndexEntry(summary: KankaEntitySummary): EntityIndexEntry {
     const segments = this.computeFolderSegments(summary.type ?? summary.entity_type);
     const basename = this.buildBasename(summary.id, summary.name, summary.slug);
-    const path = [segments.join("/"), `${basename}.md`].filter(Boolean).join("/");
-    return { path, name: summary.name };
+    const initialPath = [segments.join("/"), `${basename}.md`].filter(Boolean).join("/");
+    const uniquePath = this.reserveUniquePath(initialPath, summary.id);
+    return { path: uniquePath, name: summary.name };
   }
 
   private computeFolderSegments(type?: string | null): string[] {
@@ -246,9 +245,13 @@ export default class KankaSyncPlugin extends Plugin {
   }
 
   private buildBasename(id: number | string, name: string, slug?: string | null): string {
-    const slugified = slug ? this.slugify(slug) : "";
-    const nameSlug = this.slugify(name);
-    return `${id}-${slugified || nameSlug || "entity"}`;
+    const sanitized = this.sanitizeFileName(name);
+    if (sanitized) return sanitized;
+    if (slug) {
+      const slugSanitized = this.sanitizeFileName(slug);
+      if (slugSanitized) return slugSanitized;
+    }
+    return String(id);
   }
 
   private convertReferences(markdown: string): string {
@@ -266,13 +269,13 @@ export default class KankaSyncPlugin extends Plugin {
       return `[[${entry.path}|${display}]]`;
     };
 
-    const withMarkdownLinks = markdown.replace(linkRegex, (match, text) => {
+    const withLinks = markdown.replace(linkRegex, (match, text) => {
       const idMatch = match.match(new RegExp(basePattern, "i"));
       if (!idMatch) return match;
       return replaceWithLink(idMatch[1], text) ?? match;
     });
 
-    return withMarkdownLinks.replace(bareRegex, (match, entityId) => replaceWithLink(entityId) ?? match);
+    return withLinks.replace(bareRegex, (match, entityId) => replaceWithLink(entityId) ?? match);
   }
 
   private async ensureFolder(path: string) {
@@ -300,6 +303,53 @@ export default class KankaSyncPlugin extends Plugin {
       .toLowerCase();
   }
 
+  private sanitizeFileName(name: string): string {
+    return name
+      .trim()
+      .replace(/[\\/:*?"<>|]/g, "-")
+      .replace(/\s+/g, " ")
+      .replace(/^\.+/, "")
+      .replace(/\.+$/, "");
+  }
+
+  private splitPath(fullPath: string): { base: string; ext: string } {
+    const normalized = normalizePath(fullPath);
+    const dot = normalized.lastIndexOf(".");
+    if (dot === -1) return { base: normalized, ext: "" };
+    return {
+      base: normalized.slice(0, dot),
+      ext: normalized.slice(dot),
+    };
+  }
+
+  private reserveUniquePath(path: string, id: number | string): string {
+    let normalized = normalizePath(path);
+    let lower = normalized.toLowerCase();
+    if (!this.usedPaths.has(lower)) {
+      this.usedPaths.add(lower);
+      return normalized;
+    }
+
+    const { base, ext } = this.splitPath(normalized);
+    const withId = `${base} (${id})${ext}`;
+    lower = withId.toLowerCase();
+    if (!this.usedPaths.has(lower)) {
+      this.usedPaths.add(lower);
+      return withId;
+    }
+
+    let counter = 2;
+    while (true) {
+      const candidate = `${base} (${counter})${ext}`;
+      lower = candidate.toLowerCase();
+      if (!this.usedPaths.has(lower)) {
+        this.usedPaths.add(lower);
+        return candidate;
+      }
+      counter += 1;
+    }
+  }
+
   private async throttle() {
     const wait = Math.max(0, this.settings.apiThrottleMs);
     if (wait <= 0) {
@@ -309,9 +359,7 @@ export default class KankaSyncPlugin extends Plugin {
 
     const now = Date.now();
     const elapsed = now - this.lastRequestAt;
-    if (elapsed < wait) {
-      await this.delay(wait - elapsed);
-    }
+    if (elapsed < wait) await this.delay(wait - elapsed);
     this.lastRequestAt = Date.now();
   }
 
@@ -323,20 +371,23 @@ export default class KankaSyncPlugin extends Plugin {
     if (!type) return false;
     const normalized = type.toLowerCase().trim();
     if (!normalized) return false;
+
     const candidates = normalized.endsWith("s")
       ? [normalized, normalized.slice(0, -1)]
       : [normalized, `${normalized}s`];
+
     const excluded = this.settings.excludedTypes
       .map((value) => value.toLowerCase().trim())
       .filter(Boolean);
+
     return candidates.some((candidate) => excluded.includes(candidate));
   }
 
   private async apiRequest<T>(path: string): Promise<T> {
     await this.throttle();
-    const campaignId = this.settings.campaignId.trim();
+    const campaign = this.settings.campaignId.trim();
     const response = await requestUrl({
-      url: `https://api.kanka.io/1.0/campaigns/${encodeURIComponent(campaignId)}${path}`,
+      url: `https://api.kanka.io/1.0/campaigns/${encodeURIComponent(campaign)}${path}`,
       method: "GET",
       headers: {
         "Authorization": `Bearer ${this.settings.apiToken.trim()}`,
@@ -364,6 +415,9 @@ export default class KankaSyncPlugin extends Plugin {
         return;
       }
 
+      const occupied = new Set<string>();
+      for (const file of files) occupied.add(file.path.toLowerCase());
+
       let renamed = 0;
       let skipped = 0;
 
@@ -374,8 +428,11 @@ export default class KankaSyncPlugin extends Plugin {
         const entityType = cache?.frontmatter?.type ?? cache?.frontmatter?.entity_type ?? "";
         const slug = cache?.frontmatter?.kanka_slug ?? "";
 
+        occupied.delete(file.path.toLowerCase());
+
         if (!name) {
           skipped += 1;
+          occupied.add(file.path.toLowerCase());
           continue;
         }
 
@@ -385,23 +442,50 @@ export default class KankaSyncPlugin extends Plugin {
           name,
           slug
         );
-        const targetPath = normalizePath([segments.join("/"), `${basename}.md`].filter(Boolean).join("/"));
+        const initialPath = normalizePath([segments.join("/"), `${basename}.md`].filter(Boolean).join("/"));
+        const targetPath = this.findRenameTarget(initialPath, occupied, kankaId);
+
         if (targetPath === file.path) {
           skipped += 1;
+          occupied.add(file.path.toLowerCase());
           continue;
         }
 
         await this.ensureFolder(segments.join("/"));
         await this.app.vault.rename(file, targetPath);
+        occupied.add(targetPath.toLowerCase());
         renamed += 1;
       }
 
-      const parts = [`${renamed} rinominate`];
-      if (skipped) parts.push(`${skipped} senza name o già corrette`);
-      new Notice(`Kanka Sync: ${parts.join(", ")}`);
+      const stats = [`${renamed} rinominate`];
+      if (skipped) stats.push(`${skipped} senza name o già corrette`);
+      new Notice(`Kanka Sync: ${stats.join(", ")}`);
     } catch (error: any) {
       console.error(error);
       new Notice(`Kanka Sync: errore rinomina — ${error?.message || error}`);
+    }
+  }
+
+  private findRenameTarget(
+    desiredPath: string,
+    occupied: Set<string>,
+    id?: number | string | null
+  ): string {
+    let candidate = normalizePath(desiredPath);
+    if (!occupied.has(candidate.toLowerCase())) return candidate;
+
+    const { base, ext } = this.splitPath(candidate);
+
+    if (id != null) {
+      const withId = `${base} (${id})${ext}`;
+      if (!occupied.has(withId.toLowerCase())) return withId;
+    }
+
+    let counter = 2;
+    while (true) {
+      const option = `${base} (${counter})${ext}`;
+      if (!occupied.has(option.toLowerCase())) return option;
+      counter += 1;
     }
   }
 
