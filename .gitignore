@@ -140,3 +140,6 @@ vite.config.ts.timestamp-*
 
 # Cartella moduli di progetto
 node_modules/
+
+# File di configurazione
+data.json
